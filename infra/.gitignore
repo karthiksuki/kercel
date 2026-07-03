@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+cdk.out/
+.pytest_cache/
+.mypy_cache/
+.env
+.env.*
