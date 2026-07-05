@@ -126,16 +126,6 @@ npm run dev
 
 Open http://localhost:3000.
 
-## API
-
-| Method | Endpoint | Description |
-|---------|----------|-------------|
-| POST | `/projects` | Create a project |
-| GET | `/users/{id}` | Get user |
-| POST | `/deployments` | Trigger deployment |
-| GET | `/deployments/{id}` | Get deployment status |
-| WebSocket | `?deploymentId=` | Stream deployment logs |
-
 ## Contributing
 
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull request.

@@ -27,16 +27,20 @@ network = NetworkStack(
     f"{stack_prefix}-Network",
     stage=stage,
     env=env,
-    description="Kercel VPC and security groups",
+    description="Kercel VPC, subnets, and security groups",
 )
 
 data = DataStack(
     app,
     f"{stack_prefix}-Data",
     stage=stage,
+    config=config,
+    vpc=network.vpc,
+    redis_security_group=network.redis_security_group,
     env=env,
-    description="Kercel DynamoDB tables, S3 artifacts, and deployment queue",
+    description="Kercel DynamoDB, S3, SQS, and Redis",
 )
+data.add_dependency(network)
 
 compute = ComputeStack(
     app,
@@ -45,13 +49,14 @@ compute = ComputeStack(
     config=config,
     vpc=network.vpc,
     alb_security_group=network.alb_security_group,
-    instance_security_group=network.instance_security_group,
-    projects_table=data.projects_table,
-    deployments_table=data.deployments_table,
+    compute_security_group=network.compute_security_group,
+    history_table=data.history_table,
+    deploy_act_table=data.deploy_act_table,
     artifacts_bucket=data.artifacts_bucket,
+    output_bucket=data.output_bucket,
     deployment_queue=data.deployment_queue,
     env=env,
-    description="Kercel EC2 hosts, ALB, and deployment worker Lambda",
+    description="Kercel EC2 build workers and ALB",
 )
 compute.add_dependency(network)
 compute.add_dependency(data)
@@ -60,12 +65,19 @@ api = ApiStack(
     app,
     f"{stack_prefix}-Api",
     stage=stage,
-    projects_table=data.projects_table,
-    deployments_table=data.deployments_table,
+    vpc=network.vpc,
+    api_lambda_security_group=network.api_lambda_security_group,
+    user_table=data.user_table,
+    project_table=data.project_table,
+    history_table=data.history_table,
+    deploy_act_table=data.deploy_act_table,
+    ws_connections_table=data.ws_connections_table,
     deployment_queue=data.deployment_queue,
+    redis_cluster=data.redis_cluster,
     env=env,
-    description="Kercel REST API (GitHub project intake and deployments)",
+    description="Kercel REST and WebSocket APIs",
 )
+api.add_dependency(network)
 api.add_dependency(data)
 
 delivery = DeliveryStack(
@@ -74,7 +86,7 @@ delivery = DeliveryStack(
     stage=stage,
     load_balancer=compute.load_balancer,
     env=env,
-    description="Kercel Global Accelerator for global app delivery",
+    description="Kercel Global Accelerator",
 )
 delivery.add_dependency(compute)
 
