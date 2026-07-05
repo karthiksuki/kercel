@@ -1,4 +1,6 @@
 from aws_cdk import CfnOutput, Duration, RemovalPolicy
+from aws_cdk import aws_cloudfront as cloudfront
+from aws_cdk import aws_cloudfront_origins as origins
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_elasticache as elasticache
@@ -137,6 +139,43 @@ class DatabaseConstruct(Construct):
             auto_delete_objects=not is_prod,
         )
 
+        oac = cloudfront.S3OriginAccessControl(
+            self,
+            "OutputBucketOac",
+            origin_access_control_name=f"kercel-output-oac-{stage}",
+            signing=cloudfront.Signing.SIGV4_ALWAYS,
+        )
+
+        self.distribution = cloudfront.Distribution(
+            self,
+            "SitesDistribution",
+            comment=f"Kercel deployed sites ({stage})",
+            default_root_object="index.html",
+            default_behavior=cloudfront.BehaviorOptions(
+                origin=origins.S3BucketOrigin.with_origin_access_control(
+                    self.output_bucket,
+                    origin_access_control=oac,
+                ),
+                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                allowed_methods=cloudfront.AllowedMethods.ALLOW_GET_HEAD,
+                cached_methods=cloudfront.CachedMethods.CACHE_GET_HEAD,
+            ),
+            error_responses=[
+                cloudfront.ErrorResponse(
+                    http_status=403,
+                    response_http_status=200,
+                    response_page_path="/index.html",
+                    ttl=None,
+                ),
+                cloudfront.ErrorResponse(
+                    http_status=404,
+                    response_http_status=200,
+                    response_page_path="/index.html",
+                    ttl=None,
+                ),
+            ],
+        )
+
         self.deployment_dlq = sqs.Queue(
             self,
             "DeploymentDlq",
@@ -155,27 +194,13 @@ class DatabaseConstruct(Construct):
             ),
         )
 
-        api_subnet_ids = [
-            subnet.subnet_id
-            for subnet in vpc.select_subnets(
-                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
-            ).subnets
-            if "api" in subnet.node.path.lower()
-            or subnet.node.id.lower().startswith("api")
-        ]
-        if not api_subnet_ids:
-            api_subnet_ids = [
-                s.subnet_id
-                for s in vpc.select_subnets(
-                    subnet_group_name="api"
-                ).subnets
-            ]
+        api_subnets = vpc.select_subnets(subnet_group_name="api")
 
         subnet_group = elasticache.CfnSubnetGroup(
             self,
             "RedisSubnetGroup",
             description=f"Kercel Redis subnet group ({stage})",
-            subnet_ids=api_subnet_ids,
+            subnet_ids=api_subnets.subnet_ids,
             cache_subnet_group_name=f"kercel-redis-{stage}",
         )
 
@@ -198,6 +223,12 @@ class DatabaseConstruct(Construct):
         CfnOutput(self, "ArtifactsBucketName", value=self.artifacts_bucket.bucket_name)
         CfnOutput(self, "OutputBucketName", value=self.output_bucket.bucket_name)
         CfnOutput(self, "DeploymentQueueUrl", value=self.deployment_queue.queue_url)
+        CfnOutput(
+            self,
+            "CloudFrontDomainName",
+            value=self.distribution.distribution_domain_name,
+            description="CloudFront domain for static site delivery",
+        )
         CfnOutput(
             self,
             "RedisEndpoint",
