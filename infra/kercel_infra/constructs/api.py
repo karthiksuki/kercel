@@ -84,6 +84,10 @@ class ApiConstruct(Construct):
                 "USER_TABLE": user_table.table_name,
             },
         )
+        # BUG-06 FIX (IAM side): previously granted read_write because the
+        # handler was creating placeholder users on GET.  Now that the handler
+        # only reads (returns 404 for missing users), grant_read_data is correct
+        # and least-privilege.
         user_table.grant_read_data(get_user_fn)
 
         create_deployment_fn = self._python_function(
@@ -123,6 +127,8 @@ class ApiConstruct(Construct):
         )
         history_table.grant_read_data(get_deployment_fn)
         deploy_act_table.grant_read_data(get_deployment_fn)
+        # Extra policy for Query on the history GSI and direct table Query.
+        # grant_read_data covers GetItem/BatchGetItem/Scan but not Query on GSIs.
         get_deployment_fn.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["dynamodb:Query"],
@@ -130,6 +136,7 @@ class ApiConstruct(Construct):
                     history_table.table_arn,
                     f"{history_table.table_arn}/index/*",
                     deploy_act_table.table_arn,
+                    f"{deploy_act_table.table_arn}/index/*",
                 ],
             )
         )
@@ -157,7 +164,25 @@ class ApiConstruct(Construct):
                 resources=["*"],
             )
         )
+        # The log streamer also queries deploy_act_table by primary key (on
+        # WebSocket connect, to replay existing logs) — needs Query permission.
+        log_streamer_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["dynamodb:Query"],
+                resources=[
+                    deploy_act_table.table_arn,
+                    ws_connections_table.table_arn,
+                    f"{ws_connections_table.table_arn}/index/*",
+                ],
+            )
+        )
 
+        # CDK's DynamoEventSource internally calls table.grantStreamRead()
+        # which adds the stream-level IAM permissions
+        # (GetRecords / GetShardIterator / DescribeStream / ListStreams) on
+        # the stream ARN — not just the table ARN.  So stream permissions are
+        # handled automatically by CDK; the grant_read_data above covers the
+        # table-level reads the handler also needs.
         log_streamer_fn.add_event_source(
             lambda_event_sources.DynamoEventSource(
                 deploy_act_table,
@@ -167,6 +192,9 @@ class ApiConstruct(Construct):
             )
         )
 
+        # -------------------------------------------------------------------
+        # REST API
+        # -------------------------------------------------------------------
         self.rest_api = apigateway.RestApi(
             self,
             "KercelRestApi",
@@ -177,17 +205,81 @@ class ApiConstruct(Construct):
                 throttling_rate_limit=100,
                 throttling_burst_limit=200,
             ),
+            # BUG-19 FIX: allow_origins was Cors.ALL_ORIGINS ("*") in every
+            # environment.  With no authentication on the API (BUG-11), this
+            # meant ANY web page could make credentialed cross-origin requests
+            # to the Kercel API on behalf of a logged-in user.
+            #
+            # Fix: restrict to known frontend domains per stage.  In dev we
+            # keep a broad allowlist; in prod we lock it down to the actual
+            # frontend origin.  Replace "https://app.kercel.dev" with your
+            # real domain once DNS is configured.
+            #
+            # NOTE: CORS alone does not secure the API — it only prevents
+            # browsers from issuing cross-origin requests.  Server-side
+            # authorisation (BUG-11, tracked separately) is still required.
             default_cors_preflight_options=apigateway.CorsOptions(
-                allow_origins=apigateway.Cors.ALL_ORIGINS,
+                allow_origins=(
+                    apigateway.Cors.ALL_ORIGINS
+                    if stage != "prod"
+                    else ["https://app.kercel.dev"]
+                ),
                 allow_methods=apigateway.Cors.ALL_METHODS,
-                allow_headers=["Content-Type", "Authorization"],
+                allow_headers=["Content-Type", "Authorization", "X-Api-Key"],
             ),
         )
 
+        # -------------------------------------------------------------------
+        # BUG-11 FIX: Add API key authentication to all REST endpoints.
+        #
+        # Previously every endpoint was completely open — no authentication,
+        # no authorisation, no rate limiting.  Any anonymous caller could:
+        #   • Trigger unlimited deployments (running up EC2/S3 costs)
+        #   • Read any user's data by guessing UUIDs
+        #   • Clone arbitrary GitHub URLs on our EC2 instances
+        #
+        # We add API Gateway's built-in API key + Usage Plan mechanism.  This
+        # is not OAuth/JWT (full identity management is a future milestone) but
+        # it immediately:
+        #   • Blocks anonymous abuse (requires a secret key in X-Api-Key header)
+        #   • Enables per-key rate limiting and quota enforcement
+        #   • Provides per-key usage metrics in CloudWatch
+        #
+        # The API key value is auto-generated by API GW and retrievable from
+        # the AWS Console or CLI: `aws apigateway get-api-keys --include-values`
+        # -------------------------------------------------------------------
+        api_key = self.rest_api.add_api_key(
+            "KercelApiKey",
+            api_key_name=f"kercel-api-key-{stage}",
+            description=f"Kercel {stage} API key — rotate via AWS Console",
+        )
+
+        usage_plan = self.rest_api.add_usage_plan(
+            "UsagePlan",
+            name=f"kercel-plan-{stage}",
+            description=f"Kercel {stage} usage plan",
+            throttle=apigateway.ThrottleSettings(
+                rate_limit=100,
+                burst_limit=200,
+            ),
+            quota=apigateway.QuotaSettings(
+                limit=10_000,
+                period=apigateway.Period.DAY,
+            ),
+        )
+        usage_plan.add_api_stage(
+            stage=self.rest_api.deployment_stage,
+        )
+        usage_plan.add_api_key(api_key)
+
+        # All REST routes require the API key (X-Api-Key header).
+
+        # Routes
         projects = self.rest_api.root.add_resource("projects")
         projects.add_method(
             "POST",
             apigateway.LambdaIntegration(create_project_fn),
+            api_key_required=True,
         )
 
         users = self.rest_api.root.add_resource("users")
@@ -195,19 +287,25 @@ class ApiConstruct(Construct):
         user.add_method(
             "GET",
             apigateway.LambdaIntegration(get_user_fn),
+            api_key_required=True,
         )
 
         deployments = self.rest_api.root.add_resource("deployments")
         deployments.add_method(
             "POST",
             apigateway.LambdaIntegration(create_deployment_fn),
+            api_key_required=True,
         )
         deployment = deployments.add_resource("{id}")
         deployment.add_method(
             "GET",
             apigateway.LambdaIntegration(get_deployment_fn),
+            api_key_required=True,
         )
 
+        # -------------------------------------------------------------------
+        # WebSocket API
+        # -------------------------------------------------------------------
         self.websocket_api = apigwv2.WebSocketApi(
             self,
             "KercelWebSocketApi",
@@ -258,6 +356,15 @@ class ApiConstruct(Construct):
             "WebSocketApiUrl",
             value=self.websocket_stage.url,
             description="Kercel WebSocket API URL (append ?deploymentId=...)",
+        )
+        CfnOutput(
+            self,
+            "ApiKeyId",
+            value=api_key.key_id,
+            description=(
+                "API key ID — retrieve value with: "
+                "aws apigateway get-api-key --api-key <id> --include-value"
+            ),
         )
 
     def _python_function(

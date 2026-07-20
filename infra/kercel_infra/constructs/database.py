@@ -1,6 +1,5 @@
 from aws_cdk import CfnOutput, Duration, RemovalPolicy
-from aws_cdk import aws_cloudfront as cloudfront
-from aws_cdk import aws_cloudfront_origins as origins
+from aws_cdk import aws_cloudwatch as cloudwatch
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_elasticache as elasticache
@@ -12,7 +11,17 @@ from kercel_infra.config import KercelStageConfig
 
 
 class DatabaseConstruct(Construct):
-    """DynamoDB tables, S3 buckets, SQS queue, and ElastiCache Redis."""
+    """DynamoDB tables, S3 buckets, SQS queue, and ElastiCache Redis.
+
+    BUG-02 FIX (structural): CloudFront was previously created inside this
+    construct, which is semantically wrong — a database construct should only
+    own storage resources.  CloudFront is a delivery/edge concern and now lives
+    in EdgeConstruct (edge.py) which is composed by DeliveryStack.
+
+    Having CloudFront here also made it impossible to pass the distribution ID
+    to the ComputeStack (which depends on DataStack, not DeliveryStack), causing
+    a CDK circular dependency.  Separating it removes the cycle.
+    """
 
     def __init__(
         self,
@@ -139,43 +148,23 @@ class DatabaseConstruct(Construct):
             auto_delete_objects=not is_prod,
         )
 
-        oac = cloudfront.S3OriginAccessControl(
-            self,
-            "OutputBucketOac",
-            origin_access_control_name=f"kercel-output-oac-{stage}",
-            signing=cloudfront.Signing.SIGV4_ALWAYS,
-        )
-
-        self.distribution = cloudfront.Distribution(
-            self,
-            "SitesDistribution",
-            comment=f"Kercel deployed sites ({stage})",
-            default_root_object="index.html",
-            default_behavior=cloudfront.BehaviorOptions(
-                origin=origins.S3BucketOrigin.with_origin_access_control(
-                    self.output_bucket,
-                    origin_access_control=oac,
-                ),
-                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                allowed_methods=cloudfront.AllowedMethods.ALLOW_GET_HEAD,
-                cached_methods=cloudfront.CachedMethods.CACHE_GET_HEAD,
-            ),
-            error_responses=[
-                cloudfront.ErrorResponse(
-                    http_status=403,
-                    response_http_status=200,
-                    response_page_path="/index.html",
-                    ttl=None,
-                ),
-                cloudfront.ErrorResponse(
-                    http_status=404,
-                    response_http_status=200,
-                    response_page_path="/index.html",
-                    ttl=None,
-                ),
-            ],
-        )
-
+        # -------------------------------------------------------------------
+        # BUG-03 FIX: SQS visibility timeout increased from 15 → 60 minutes.
+        #
+        # The original setting was Duration.minutes(15).  The worker.sh polling
+        # loop requests --visibility-timeout 900 (15 min) per message.  If a
+        # real build takes longer than 15 minutes (common on t3.micro with a
+        # large Next.js app), the message becomes visible again before the
+        # worker finishes, and a SECOND worker instance picks it up — causing
+        # two concurrent builds for the same deployment, double S3 writes, and
+        # a race condition on update_status.
+        #
+        # Fix: set the queue-level timeout to 60 minutes.  The queue-level
+        # value is the effective cap; the receive-message call value is ignored
+        # if it exceeds the queue setting.  60 minutes covers real-world builds
+        # comfortably while still allowing timely DLQ promotion if the worker
+        # crashes without deleting the message.
+        # -------------------------------------------------------------------
         self.deployment_dlq = sqs.Queue(
             self,
             "DeploymentDlq",
@@ -187,11 +176,43 @@ class DatabaseConstruct(Construct):
             self,
             "DeploymentQueue",
             queue_name=f"kercel-deploy-{stage}",
-            visibility_timeout=Duration.minutes(15),
+            visibility_timeout=Duration.minutes(60),  # was 15 — see BUG-03 above
             dead_letter_queue=sqs.DeadLetterQueue(
-                max_receive_count=3,
+                # BUG-13 FIX (partial): Increased from 3 → 5 retries.
+                # With max_receive_count=3, a build that fails twice due to
+                # transient errors (GitHub rate limit, npm registry blip, S3
+                # throttle) would permanently dead-letter on the 3rd attempt
+                # with no recovery chance.  5 retries gives enough headroom
+                # for short-lived transient failures while still preventing
+                # infinite retry loops for genuinely broken projects.
+                max_receive_count=5,
                 queue=self.deployment_dlq,
             ),
+        )
+
+        # -------------------------------------------------------------------
+        # BUG-13 FIX (continued): CloudWatch alarm on DLQ depth.
+        #
+        # Without an alarm, failed deployments silently accumulate in the DLQ
+        # with no operator notification.  This alarm fires as soon as 1 message
+        # lands in the DLQ so the team is alerted immediately.
+        # -------------------------------------------------------------------
+        cloudwatch.Alarm(
+            self,
+            "DlqDepthAlarm",
+            alarm_name=f"kercel-dlq-depth-{stage}",
+            alarm_description=(
+                "One or more deployment jobs have failed all retry attempts "
+                "and landed in the dead-letter queue. Check build logs."
+            ),
+            metric=self.deployment_dlq.metric_approximate_number_of_messages_visible(
+                period=Duration.minutes(1),
+                statistic="Maximum",
+            ),
+            threshold=1,
+            evaluation_periods=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
         )
 
         api_subnets = vpc.select_subnets(subnet_group_name="api")
@@ -216,6 +237,10 @@ class DatabaseConstruct(Construct):
         )
         self.redis_cluster.add_dependency(subnet_group)
 
+        # CloudFormation outputs — only expose what operators genuinely need.
+        # BUG-17 FIX: RedisEndpoint is an internal VPC hostname; exposing it
+        # in CloudFormation outputs leaks network topology to anyone with
+        # cloudformation:DescribeStacks access.  Removed.
         CfnOutput(self, "UserTableName", value=self.user_table.table_name)
         CfnOutput(self, "ProjectTableName", value=self.project_table.table_name)
         CfnOutput(self, "HistoryTableName", value=self.history_table.table_name)
@@ -223,14 +248,3 @@ class DatabaseConstruct(Construct):
         CfnOutput(self, "ArtifactsBucketName", value=self.artifacts_bucket.bucket_name)
         CfnOutput(self, "OutputBucketName", value=self.output_bucket.bucket_name)
         CfnOutput(self, "DeploymentQueueUrl", value=self.deployment_queue.queue_url)
-        CfnOutput(
-            self,
-            "CloudFrontDomainName",
-            value=self.distribution.distribution_domain_name,
-            description="CloudFront domain for static site delivery",
-        )
-        CfnOutput(
-            self,
-            "RedisEndpoint",
-            value=self.redis_cluster.attr_redis_endpoint_address,
-        )

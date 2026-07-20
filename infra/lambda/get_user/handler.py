@@ -25,15 +25,19 @@ def handler(event, context):
         return json_response(200, cached)
 
     result = user_table.get_item(Key={"userId": user_id})
-    if "Item" not in result:
-        placeholder = {
-            "userId": user_id,
-            "email": f"{user_id}@placeholder.kercel.dev",
-            "createdAt": _now_iso(),
-        }
-        user_table.put_item(Item=placeholder)
-        cache_set(cache_key, placeholder)
-        return json_response(200, placeholder)
 
-    cache_set(cache_key, result["Item"])
-    return json_response(200, result["Item"])
+    # BUG-06 FIX: The original code auto-created a phantom user record for any
+    # unknown userId and returned 200 OK. This had two problems:
+    #
+    # 1. Any anonymous caller could pollute the users table by GETting arbitrary
+    #    UUIDs — the table would fill with fake "@placeholder.kercel.dev" records.
+    # 2. It masked the real 404 condition, making the API misleading (a GET
+    #    should never silently mutate state).
+    #
+    # Correct behaviour: if the user does not exist, return 404 and do nothing.
+    if "Item" not in result:
+        return json_response(404, {"error": "User not found"})
+
+    item = result["Item"]
+    cache_set(cache_key, item)
+    return json_response(200, item)

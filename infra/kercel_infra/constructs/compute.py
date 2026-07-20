@@ -1,6 +1,6 @@
 import os
 
-from aws_cdk import CfnOutput, Duration
+from aws_cdk import CfnOutput, Duration, Stack
 from aws_cdk import aws_autoscaling as autoscaling
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_ec2 as ec2
@@ -70,6 +70,42 @@ class ComputeConstruct(Construct):
             )
         )
 
+        # -------------------------------------------------------------------
+        # BUG-02 (CloudFront invalidation) + BUG-15 (aws-cli on AL2023):
+        #
+        # The worker needs to call `aws cloudfront create-invalidation` after
+        # each successful build so browsers immediately see the new deployment
+        # instead of cached old content.
+        #
+        # CloudFront:CreateInvalidation must be granted to the instance role.
+        # We can't scope it to a specific distribution ARN here because the
+        # distribution is created in DeliveryStack (which depends on this
+        # stack) — a forward reference.  Granting on "*" is acceptable for
+        # CloudFront invalidation: the worst an attacker with EC2 access could
+        # do is trigger cache invalidations, which have cost implications but
+        # no data-access implications.
+        # -------------------------------------------------------------------
+        instance_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["cloudfront:CreateInvalidation"],
+                resources=["*"],
+            )
+        )
+
+        # Grant read access to the SSM parameter where DeliveryStack writes
+        # the CloudFront distribution ID.  The worker reads this at runtime
+        # (not at synth time) so there's no circular CDK dependency.
+        instance_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["ssm:GetParameter"],
+                resources=[
+                    f"arn:aws:ssm:{Stack.of(self).region}:"
+                    f"{Stack.of(self).account}:"
+                    f"parameter/kercel/{stage}/cloudfront-distribution-id"
+                ],
+            )
+        )
+
         worker_script_path = os.path.join(
             os.path.dirname(__file__), "..", "..", "lambda", "build-worker", "worker.sh"
         )
@@ -80,7 +116,19 @@ class ComputeConstruct(Construct):
         user_data.add_commands(
             "set -euxo pipefail",
             "dnf update -y",
-            "dnf install -y git nodejs npm aws-cli",
+            # BUG-15 FIX: The original command included `aws-cli` in this list:
+            #   dnf install -y git nodejs npm aws-cli
+            #
+            # Amazon Linux 2023 ships AWS CLI v2 pre-installed.  Running
+            # `dnf install aws-cli` pulls in CLI v1 from the AL2023 package
+            # repo, which can silently override the pre-installed v2 binary or
+            # create a PATH conflict.  It also wastes 30-60 seconds of boot
+            # time downloading a package that's already present.
+            #
+            # Fix: remove `aws-cli` from the install list.  The pre-installed
+            # CLI v2 is used as-is.  `which aws` will confirm it's at
+            # /usr/local/bin/aws (v2 path on AL2023).
+            "dnf install -y git nodejs npm",
             f"export DEPLOYMENT_QUEUE_URL={deployment_queue.queue_url}",
             f"export HISTORY_TABLE={history_table.table_name}",
             f"export DEPLOY_ACT_TABLE={deploy_act_table.table_name}",
