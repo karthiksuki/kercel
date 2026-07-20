@@ -1,3 +1,4 @@
+import json  # BUG-10 FIX: was __import__("json") inside the handler body — a leftover debug trick
 import os
 import uuid
 from datetime import datetime, timezone
@@ -15,7 +16,10 @@ def _now_iso() -> str:
 
 
 def handler(event, context):
-    body = __import__("json").loads(event.get("body") or "{}")
+    # __import__("json") bypasses the module import cache on every cold start
+    # and makes the code confusing for anyone reading it.
+    # Standard top-level import is the correct pattern.
+    body = json.loads(event.get("body") or "{}")
     name = body.get("name")
     github_url = body.get("githubUrl")
     owner_id = body.get("ownerId", "anonymous")

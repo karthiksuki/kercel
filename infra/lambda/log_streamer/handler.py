@@ -55,13 +55,35 @@ def _handle_connect(event: dict) -> dict:
         }
     )
 
-    actions = deploy_act_table.query(
-        KeyConditionExpression=Key("deploymentId").eq(deployment_id),
-        ScanIndexForward=True,
-        Limit=20,
-    )
-    for action in actions.get("Items", []):
-        _post_to_connection(connection_id, {"type": "log", **action})
+    # BUG-05 FIX: The original code had Limit=20 with no pagination.
+    # For any build that emits more than 20 log actions (which is nearly every
+    # real build — install + build alone produce dozens), the newly connected
+    # browser would only see the first 20 lines and silently miss everything
+    # else.  The fix is a standard DynamoDB pagination loop: keep querying while
+    # LastEvaluatedKey is present in the response so we replay *all* existing
+    # actions to the client on initial connect.
+    #
+    # We keep ScanIndexForward=True so actions are replayed in chronological
+    # order (oldest first) which matches what the user sees in the terminal UI.
+    #
+    # NOTE: deploy_act_table PK = deploymentId, SK = actionTimestamp.
+    # This query runs on the primary key — no GSI needed, no index/* IAM required.
+    exclusive_start_key = None
+    while True:
+        query_kwargs: dict = {
+            "KeyConditionExpression": Key("deploymentId").eq(deployment_id),
+            "ScanIndexForward": True,
+        }
+        if exclusive_start_key:
+            query_kwargs["ExclusiveStartKey"] = exclusive_start_key
+
+        actions = deploy_act_table.query(**query_kwargs)
+        for action in actions.get("Items", []):
+            _post_to_connection(connection_id, {"type": "log", **action})
+
+        exclusive_start_key = actions.get("LastEvaluatedKey")
+        if not exclusive_start_key:
+            break
 
     return {"statusCode": 200, "body": "Connected"}
 

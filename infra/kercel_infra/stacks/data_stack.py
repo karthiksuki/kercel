@@ -2,7 +2,7 @@ from aws_cdk import Stack
 from aws_cdk import aws_ec2 as ec2
 from constructs import Construct
 
-from kercel_infra.config import KercelStageConfig, get_stage_config
+from kercel_infra.config import KercelStageConfig
 from kercel_infra.constructs.database import DatabaseConstruct
 
 
@@ -15,18 +15,31 @@ class DataStack(Stack):
         stage: str,
         vpc: ec2.IVpc,
         redis_security_group: ec2.ISecurityGroup,
-        config: KercelStageConfig | None = None,
+        # BUG-18 FIX: The original signature had `config: KercelStageConfig | None = None`
+        # with a silent fallback `stage_config = config or get_stage_config(stage)`.
+        #
+        # The problem:
+        #   1. The fallback is dead code — app.py always passes config explicitly.
+        #   2. If someone accidentally omits config in a future call, Python would
+        #      silently re-derive it with a second get_stage_config() call.  If
+        #      get_stage_config() is ever made non-deterministic (feature flags,
+        #      environment lookups, etc.), the two config objects could differ,
+        #      leading to subtle size/capacity mismatches between stacks.
+        #   3. Having None as a valid value sends the wrong signal — config is
+        #      always required for this stack.
+        #
+        # Fix: make config a required parameter (no default).  Callers that omit
+        # it will get a clear TypeError at import time rather than silent drift.
+        config: KercelStageConfig,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
-
-        stage_config = config or get_stage_config(stage)
 
         database = DatabaseConstruct(
             self,
             "Database",
             stage=stage,
-            config=stage_config,
+            config=config,
             vpc=vpc,
             redis_security_group=redis_security_group,
         )
@@ -41,4 +54,7 @@ class DataStack(Stack):
         self.deployment_queue = database.deployment_queue
         self.deployment_dlq = database.deployment_dlq
         self.redis_cluster = database.redis_cluster
-        self.distribution = database.distribution
+        # BUG-02 FIX: self.distribution was previously exposed here because
+        # CloudFront was incorrectly placed inside DatabaseConstruct.
+        # CloudFront is now in EdgeConstruct (edge.py) / DeliveryStack,
+        # where it belongs architecturally.  Removed from DataStack.

@@ -34,6 +34,8 @@ data = DataStack(
     app,
     f"{stack_prefix}-Data",
     stage=stage,
+    # BUG-18 FIX: config is now a required positional-keyword argument in DataStack
+    # (the None-fallback was removed).  Always pass it explicitly.
     config=config,
     vpc=network.vpc,
     redis_security_group=network.redis_security_group,
@@ -85,10 +87,17 @@ delivery = DeliveryStack(
     f"{stack_prefix}-Delivery",
     stage=stage,
     load_balancer=compute.load_balancer,
+    # BUG-02 FIX: pass output_bucket so DeliveryStack/EdgeConstruct can create
+    # the CloudFront distribution pointing at it.  Previously CloudFront was
+    # created inside DataStack (DatabaseConstruct) with no way to invalidate
+    # after builds because the distribution ID was unavailable to ComputeStack.
+    output_bucket=data.output_bucket,
     env=env,
-    description="Kercel Global Accelerator",
+    description="Kercel Global Accelerator + CloudFront site delivery",
 )
 delivery.add_dependency(compute)
+# DeliveryStack also depends on DataStack because it reads output_bucket.
+delivery.add_dependency(data)
 
 cdk.Tags.of(app).add("project", "kercel")
 cdk.Tags.of(app).add("stage", stage)
